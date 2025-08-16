@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  # app:
+  #   build: .
+  #   container_name: strimemu
+  #   depends_on:
+  #     - mongodb
+  #   command: >
+  #     ./main --start_url https://golang.org --max_depth 1
+  #   restart: on-failure
+
+  mongodb:
+    image: mongo:latest
+    container_name: mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: example
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    restart: unless-stopped
+
+volumes:
+  mongodb_data:
