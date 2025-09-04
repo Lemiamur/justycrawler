@@ -1,8 +1,8 @@
 # Настройки веб-краулера
 start_url: "https://ru.wikipedia.org/wiki/Android" 
 same_host: true
-max_depth: 3
-worker_count: 3
+max_depth: 1
+worker_count: 30
 
 # Настройки HTTP клиента
 http:
@@ -13,6 +13,13 @@ mongo:
   uri: "mongodb://root:example@localhost:27017" 
   database: "crawler_db"
   collection: "links"
+
+# Настройки состояния посещенных URL в Redis
+redis:
+  addr: "localhost:6379"
+  password: "" 
+  db: 0 
+  set_key: "crawler:visited_urls" 
 
 # Настройки логирования
 log:

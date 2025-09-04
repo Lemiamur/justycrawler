@@ -16,6 +16,4 @@ WORKDIR /app
 COPY --from=builder /app/main .
 COPY configs ./configs
 
-# EXPOSE 8080 # Этот порт здесь не используется, можно убрать или оставить для будущих нужд
-
 ENTRYPOINT ["./main"]

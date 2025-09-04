@@ -6,6 +6,7 @@ services:
   #   container_name: strimemu
   #   depends_on:
   #     - mongodb
+  #     - redis # Добавляем зависимость
   #   command: >
   #     ./main --start_url https://golang.org --max_depth 1
   #   restart: on-failure
@@ -20,6 +21,13 @@ services:
       - "27017:27017"
     volumes:
       - mongodb_data:/data/db
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
     restart: unless-stopped
 
 volumes:

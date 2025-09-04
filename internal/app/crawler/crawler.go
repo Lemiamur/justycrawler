@@ -9,33 +9,45 @@ import (
 	"sync"
 	"time"
 
+	"justycrawler/internal/domain"
+
 	"golang.org/x/sync/errgroup"
 )
 
+const (
+	storageTimeout = 10 * time.Second
+)
+
+// Task представляет собой задачу для краулера.
 type Task struct {
 	URL       string
 	Depth     int
-	ParentURL string // URL страницы, на которой была найдена эта ссылка
+	ParentURL string
 }
 
+// Crawler представляет собой веб-краулер.
 type Crawler struct {
 	logger      *slog.Logger
 	workerCount int
 	maxDepth    int
-	sameHost    bool // Ограничить обход только стартовым хостом
+	sameHost    bool
 	startHost   string
-	fetcher     Fetcher
-	parser      Parser
-	state       State
-	storage     Storage
+
+	fetcher Fetcher
+	parser  Parser
+	storage Storage
+	state   State
 }
 
+// NewCrawler инициализирует новый краулер с внедрением всех зависимостей.
 func NewCrawler(
 	logger *slog.Logger,
 	workerCount, maxDepth int,
 	sameHost bool,
 	fetcher Fetcher,
+	parser Parser,
 	storage Storage,
+	state State,
 ) *Crawler {
 	return &Crawler{
 		logger:      logger,
@@ -43,9 +55,9 @@ func NewCrawler(
 		maxDepth:    maxDepth,
 		sameHost:    sameHost,
 		fetcher:     fetcher,
-		parser:      &GoqueryParser{},
-		state:       NewSafeMapState(),
+		parser:      parser,
 		storage:     storage,
+		state:       state,
 	}
 }
 
@@ -57,105 +69,122 @@ func (c *Crawler) Run(ctx context.Context, startURL string) error {
 	c.startHost = parsedStartURL.Host
 
 	tasks := make(chan Task, c.workerCount)
+
+	g, ctx := errgroup.WithContext(ctx)
 	wg := &sync.WaitGroup{}
-	g, gCtx := errgroup.WithContext(ctx)
 
-	go func() {
-		wg.Wait()
-		close(tasks)
-	}()
-
-	for i := 0; i < c.workerCount; i++ {
+	for range c.workerCount {
 		g.Go(func() error {
-			for task := range tasks {
+			for {
 				select {
-				case <-gCtx.Done():
-					return gCtx.Err()
-				default:
-					c.processAndQueue(gCtx, task, tasks, wg)
+				case task, ok := <-tasks:
+					if !ok {
+						return nil
+					}
+					c.processTask(ctx, task, tasks, wg)
+				case <-ctx.Done():
+					return ctx.Err()
 				}
 			}
-			return nil
 		})
 	}
 
-	// Добавляем первую задачу
-	wg.Add(1)
-	c.state.MarkVisited(startURL)
-	select {
-	case tasks <- Task{URL: startURL, Depth: 0, ParentURL: ""}:
-	case <-gCtx.Done():
-		wg.Done()
+	added, err := c.state.Add(ctx, startURL)
+	if err != nil {
+		close(tasks)
+		return fmt.Errorf("не удалось добавить стартовый URL в стейт: %w", err)
 	}
+
+	if added {
+		c.logger.InfoContext(ctx, "Добавляем стартовую задачу в очередь.", slog.String("url", startURL))
+		wg.Add(1)
+		tasks <- Task{URL: startURL, Depth: 0, ParentURL: ""}
+	} else {
+		c.logger.InfoContext(ctx, "Стартовый URL уже был обработан ранее, новых задач нет.")
+	}
+
+	g.Go(func() error {
+		wg.Wait()
+		close(tasks)
+		return nil
+	})
 
 	return g.Wait()
 }
 
-func (c *Crawler) processAndQueue(ctx context.Context, task Task, tasks chan<- Task, wg *sync.WaitGroup) {
+func (c *Crawler) processTask(ctx context.Context, task Task, tasks chan<- Task, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	log := c.logger.With(slog.String("url", task.URL), slog.Int("depth", task.Depth))
-
-	if task.Depth >= c.maxDepth {
-		log.Debug("Достигнута максимальная глубина, задача пропущена")
-		return
-	}
-
-	log.Info("Обработка страницы")
+	log.InfoContext(ctx, "Обработка страницы")
 
 	body, err := c.fetcher.Fetch(ctx, task.URL)
 	if err != nil {
-		log.Error("Не удалось загрузить страницу", slog.Any("error", err))
+		log.ErrorContext(ctx, "Не удалось загрузить страницу", slog.Any("error", err))
 		return
 	}
 	defer body.Close()
 
 	htmlBytes, err := io.ReadAll(body)
 	if err != nil {
-		log.Error("Не удалось прочитать тело ответа", slog.Any("error", err))
+		log.ErrorContext(ctx, "Не удалось прочитать тело ответа", slog.Any("error", err))
 		return
 	}
 
-	links, err := c.parser.ParseLinks(task.URL, string(htmlBytes))
+	links, err := c.parser.ParseLinks(task.URL, htmlBytes)
 	if err != nil {
-		log.Error("Не удалось распарсить страницу", slog.Any("error", err))
+		log.ErrorContext(ctx, "Не удалось распарсить страницу", slog.Any("error", err))
 		return
 	}
 
-	crawledData := CrawledData{
+	c.handleResult(ctx, task, links)
+
+	if task.Depth >= c.maxDepth {
+		return
+	}
+
+	for _, link := range links {
+		if !c.shouldCrawl(link) {
+			continue
+		}
+
+		added, addErr := c.state.Add(ctx, link)
+		if addErr != nil {
+			log.ErrorContext(ctx, "Не удалось добавить URL в стейт", slog.Any("error", addErr))
+			continue
+		}
+		if !added {
+			log.DebugContext(ctx, "URL уже был обработан ранее.", slog.String("url", link))
+			continue
+		}
+
+		wg.Add(1)
+		select {
+		case tasks <- Task{URL: link, Depth: task.Depth + 1, ParentURL: task.URL}:
+		case <-ctx.Done():
+			wg.Done()
+			return
+		}
+	}
+}
+
+func (c *Crawler) handleResult(ctx context.Context, task Task, foundURLs []string) {
+	crawledData := domain.CrawledData{
 		URL:        task.URL,
 		Depth:      task.Depth,
 		FoundOn:    task.ParentURL,
-		FoundLinks: links,
+		FoundLinks: foundURLs,
 	}
 
-	saveCtx, saveCancel := context.WithTimeout(ctx, 10*time.Second)
-	defer saveCancel()
+	saveCtx, cancel := context.WithTimeout(ctx, storageTimeout)
+	defer cancel()
 
 	if err := c.storage.Save(saveCtx, crawledData); err != nil {
-		log.Error("Не удалось сохранить данные", slog.Any("error", err))
+		c.logger.ErrorContext(ctx, "Не удалось сохранить данные",
+			slog.String("url", task.URL), slog.Any("error", err))
 	}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for _, link := range links {
-			if c.shouldCrawl(link) && !c.state.IsVisited(link) {
-				c.state.MarkVisited(link)
-				newTask := Task{URL: link, Depth: task.Depth + 1, ParentURL: task.URL}
-				wg.Add(1)
-				select {
-				case tasks <- newTask:
-				case <-ctx.Done():
-					wg.Done()
-					return
-				}
-			}
-		}
-	}()
 }
 
-// shouldCrawl проверяет, нужно ли обходить данную ссылку.
 func (c *Crawler) shouldCrawl(link string) bool {
 	if !c.sameHost {
 		return true
